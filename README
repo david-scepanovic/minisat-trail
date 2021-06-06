@@ -11,7 +11,6 @@ LICENSE
 ================================================================================
 BUILDING: (release version: without assertions, statically linked, etc)
 
-export MROOT=<minisat-dir>              (or setenv in cshell)
 cd { core | simp }
 gmake rs
 cp minisat_static <install-dir>/minisat
