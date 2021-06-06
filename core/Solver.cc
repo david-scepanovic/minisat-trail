@@ -39,6 +39,15 @@ using namespace Minisat;
 
 static const char* _cat = "CORE";
 
+static IntOption     opt_ts_max_look       (_cat, "ts-max-look",  "The maximum number of saved levels solver will traverse for conflict lookahead", 2, IntRange(0, INT32_MAX));
+static IntOption     opt_ts_max_csize      (_cat, "ts-max-csize", "The maximum size of saved clauses solver will unit propagate", INT32_MAX, IntRange(0, INT32_MAX)); 
+
+#if !defined(TS_BRUTE_CRIT_LVLS)
+static DoubleOption  opt_ts_cap_fact       (_cat, "ts-cap-fact",  "Controls maximum saved trail capacity relative to the variable count", 1, DoubleRange(1, true, HUGE_VAL, false));
+#else 
+static DoubleOption  opt_ts_cap_fact       (_cat, "ts-cap-fact",  "Controls maximum saved trail capacity relative to the variable count", 2, DoubleRange(2, true, HUGE_VAL, false));
+#endif
+
 static DoubleOption  opt_var_decay         (_cat, "var-decay",   "The variable activity decay factor",            0.95,     DoubleRange(0, false, 1, false));
 static DoubleOption  opt_clause_decay      (_cat, "cla-decay",   "The clause activity decay factor",              0.999,    DoubleRange(0, false, 1, false));
 static DoubleOption  opt_random_var_freq   (_cat, "rnd-freq",    "The frequency with which the decision heuristic tries to choose a random variable", 0, DoubleRange(0, true, 1, true));
@@ -60,7 +69,24 @@ Solver::Solver() :
 
     // Parameters (user settable):
     //
-    verbosity        (0)
+    ts_max_look      (opt_ts_max_look)
+  , ts_max_csize     (opt_ts_max_csize)
+  , ts_cap_fact      (opt_ts_cap_fact)
+
+    // Statistics:
+    //
+  , ts_saves(0), ts_saved_lits(0), ts_saved_decs(0)
+  , ts_uses(0), ts_enqueues(0), ts_confls(0), ts_skips(0), ts_detaches(0)
+  , ts_cleans(0), ts_cleaned_lits(0)
+  , ts_lookaheads(0), ts_forced_decs(0), ts_confl_decs(0)
+    
+  , ts               (*this)
+  , ts_crit_lvl      (0)
+  , ts_in_budget     (true)
+
+    // Parameters (user settable):
+    //
+  , verbosity        (0)
   , var_decay        (opt_var_decay)
   , clause_decay     (opt_clause_decay)
   , random_var_freq  (opt_random_var_freq)
@@ -122,6 +148,7 @@ Solver::~Solver()
 Var Solver::newVar(bool sign, bool dvar)
 {
     int v = nVars();
+    ts       .push(v);
     watches  .init(mkLit(v, false));
     watches  .init(mkLit(v, true ));
     assigns  .push(l_Undef);
@@ -229,6 +256,8 @@ void Solver::removeClause(CRef cr) {
     if (locked(c)) vardata[var(c[0])].reason = CRef_Undef;
     c.mark(1); 
     ca.free(cr);
+    if (!ts.empty())
+        ts.clear();
 }
 
 
@@ -241,8 +270,15 @@ bool Solver::satisfied(const Clause& c) const {
 
 // Revert to the state at given level (keeping all assignment at 'level' but not beyond).
 //
-void Solver::cancelUntil(int level) {
+void Solver::cancelUntil(int level, bool save) {
     if (decisionLevel() > level){
+        if (save) 
+            saveTrail(level);
+#if defined(TS_BRUTE_CRIT_LVLS)
+        else
+            ts_crit_lvl = level;
+#endif
+
         for (int c = trail.size()-1; c >= trail_lim[level]; c--){
             Var      x  = var(trail[c]);
             assigns [x] = l_Undef;
@@ -259,8 +295,154 @@ void Solver::cancelUntil(int level) {
 // Major methods:
 
 
+void Solver::saveTrail(int level)
+{
+    assert(decisionLevel() > level);
+    int begin = trail_lim[level], end = trail.size();
+    const int save_cnt = end - begin;
+    
+    if (ts.size() + save_cnt > ts.capacity())
+    {
+        ts_cleaned_lits += ts.clean();
+        ++ts_cleans;
+    }
+    assert(ts.size() + save_cnt <= ts.capacity());
+    
+    assert(ts.headed());
+    for (--end; end >= begin; --end)
+    {
+        Lit l = trail[end];
+        ts.save(l, reason(var(l)));
+    }
+    ts.resetPivot();
+
+    ts_crit_lvl = level;
+
+    ts_saved_lits += save_cnt;
+    ts_saved_decs += decisionLevel() - level;
+    ++ts_saves;
+}
+
+int Solver::TrailSaver::clean()
+{
+    assert(headed());
+    vec<lbool> signs(s.nVars(), l_Undef);
+    
+    int i, j;
+    for (i = head_(), j = size(); i != end; --i)
+    {
+        Lit l = literals[i];
+        Var v = var(l);
+
+#if !defined(TS_BRUTE_CRIT_LVLS)
+        lbool val = s.value(l);
+        if (val == l_Undef && signs[v] == l_Undef)
+        {
+            signs[v] = lbool(sign(l));
+            copy_(i, --j);
+        }
+        else if (val == l_False || (signs[v] != l_Undef && signs[v] != lbool(sign(l))))
+        {
+            if (reasons[i] != CRef_Undef)
+                copy_(i, --j);
+            break;
+        }
+#else
+        if (signs[v] == l_Undef)
+        {
+            signs[v] = lbool(sign(l));
+            copy_(i, --j);
+        }
+        else if (signs[v] != lbool(sign(l)))
+        {
+            if (reasons[i] != CRef_Undef)
+                copy_(i, --j);
+            break;
+        }
+#endif
+    }
+
+    const int clean_cnt = head_() - i + (i != end);
+     
+    for (i = 0; j < size(); ++j, ++i)
+        copy_(j, i);
+    
+    shrink_(size() - i);
+    resetPivot();
+    
+    return clean_cnt;
+}
+
+int Solver::lookAhead()
+{
+    assert(ts_max_look > 0);
+    assert(ts.hasPivot());
+    assert(value(ts.pivot()) == l_Undef);
+
+    bool confl = false;
+    int lvl_ahead = 1;
+    for (ts.movePivot(); ts.hasPivot(); ts.movePivot())
+    {
+        CRef cr;
+        Lit l = ts.pivot(cr);
+        
+        lbool val = value(l);
+        if (val == l_Undef)
+        {
+            if (cr == CRef_Undef)
+            {
+                assert(lvl_ahead <= ts_max_look);
+                if (lvl_ahead == ts_max_look)
+                    break;
+                else
+                    ++lvl_ahead;
+            }
+        }
+        else if (val == l_False)
+        {
+            if (cr != CRef_Undef)
+                confl = true;
+            break;
+        }
+        assert(!confl);
+    }    
+    ts.resetPivot();
+
+    ++ts_lookaheads;
+    return confl ? lvl_ahead : -1;
+}
+
 Lit Solver::pickBranchLit()
 {
+    assert(ts.headed());
+    if (ts.hasPivot())
+    {
+        Lit l = ts.pivot();
+        if (value(l) == l_Undef)
+        {
+            if (ts_max_look > 0)
+            {
+                int confl_dist = lookAhead();
+                assert(ts.headed());
+                if (confl_dist != -1)
+                {
+                    assert(confl_dist != 0);
+                    if (confl_dist == 1)
+                        ++ts_confl_decs;
+                    ++ts_forced_decs;
+                    return l;
+                }
+            }
+        }
+#if !defined(TS_BRUTE_CRIT_LVLS)
+        else if (level(var(l)) <= ts_crit_lvl)
+        {
+            assert(value(l) == l_False);
+            ts.clear();
+        }
+#endif
+    }
+
     Var next = var_Undef;
 
     // Random decision:
@@ -471,6 +653,65 @@ void Solver::uncheckedEnqueue(Lit p, CRef from)
     trail.push_(p);
 }
 
+CRef Solver::useSavedTrail()
+{
+    assert(ts.hasPivot());
+    assert(value(ts.pivot()) == l_True);
+    
+    ++ts_skips;
+    for (ts.movePivot(); ts.hasPivot(); ts.movePivot())
+    {
+        CRef cr;
+        Lit l = ts.pivot(cr);
+
+        lbool val = value(l);
+        if (val == l_Undef)
+        {
+            if (cr != CRef_Undef)
+            {   
+                Clause& c = ca[cr];
+                if (c.size() > ts_max_csize)
+                    return CRef_Undef;
+                
+                if (c[0] != l)
+                {
+                    if (c[1] != l)
+                    {
+                        assert(c.mark() == 0);
+                        c.mark(1);
+                    
+                        watches[~l].push(Watcher(cr, c[1]));
+                        ts_dirties.push(TSDirtyWatcher(~c[1], cr));
+                        
+                        int i = 2;
+                        for (int i_end = c.size() - 1; i < i_end; ++i)
+                        {
+                            if (c[i] == l) 
+                                break;
+                        }
+                        assert(c[i] == l);
+                        c[i] = c[1];
+                    }
+                    
+                    c[1] = c[0];
+                    c[0] = l;
+                }
+                 
+                assert(c[0] == l); 
+                uncheckedEnqueue(l, cr);
+                ++ts_enqueues;
+            }
+            else 
+                return CRef_Undef;
+        }
+        else if (val == l_False)
+            return cr;
+        else 
+            ++ts_skips;
+    }
+    
+    return CRef_Undef;
+}
 
 /*_________________________________________________________________________________________________
 |
@@ -487,9 +728,19 @@ CRef Solver::propagate()
 {
     CRef    confl     = CRef_Undef;
     int     num_props = 0;
-    watches.cleanAll();
+    int     ts_unmarked = 0;    
 
+    ts_dirties.clear();
+    watches.cleanAll();
+    
     while (qhead < trail.size()){
+        if (ts.hasPivot() && value(ts.pivot()) == l_True && (confl = useSavedTrail()) != CRef_Undef)
+        {
+            qhead = trail.size();
+            ++ts_confls;
+            break;
+        }
+        
         Lit            p   = trail[qhead++];     // 'p' is enqueued fact to propagate.
         vec<Watcher>&  ws  = watches[p];
         Watcher        *i, *j, *end;
@@ -505,10 +756,22 @@ CRef Solver::propagate()
             CRef     cr        = i->cref;
             Clause&  c         = ca[cr];
             Lit      false_lit = ~p;
-            if (c[0] == false_lit)
-                c[0] = c[1], c[1] = false_lit;
-            assert(c[1] == false_lit);
-            i++;
+            ++i;
+            if (c[1] != false_lit)
+            {
+                if (c.mark() == 1)
+                {
+                    assert(value(c[0]) == l_True);
+                    assert(find(ts_dirties, TSDirtyWatcher(false_lit, cr)));
+                    c.mark(0);
+                    ++ts_unmarked;
+                    continue;
+                }
+                
+                assert(c[0] == false_lit);
+                c[0] = c[1];
+                c[1] = false_lit;
+            }
 
             // If 0th watch is true, then clause is already satisfied.
             Lit     first = c[0];
@@ -541,6 +804,38 @@ CRef Solver::propagate()
     propagations += num_props;
     simpDB_props -= num_props;
 
+    if (confl != CRef_Undef) 
+    {
+        assert(ts_dirties.size() >= ts_unmarked);
+        if (ts_dirties.size() != ts_unmarked)
+        {
+            for (int i = 0; i < ts_dirties.size(); ++i)
+            {
+                const TSDirtyWatcher& dirty = ts_dirties[i];
+                if (ca[dirty.cr].mark() == 1)
+                    watches.smudge(dirty.w);
+            }
+            
+            watches.cleanAll();
+            for (int i = 0; i < ts_dirties.size(); ++i)
+                ca[ts_dirties[i].cr].mark(0);
+            
+            ++ts_detaches;
+        }
+
+        if (ts.resetPivot())
+            ++ts_uses;
+    }
+    else if (ts.confirmPivot()) 
+    {
+        assert(ts_dirties.size() == ts_unmarked);
+#if !defined(TS_BRUTE_CRIT_LVLS)
+        ts_crit_lvl = decisionLevel();
+#endif
+        ++ts_uses;
+    }
+    assert(ts.headed());
+    
     return confl;
 }
 
@@ -634,7 +929,6 @@ bool Solver::simplify()
     return true;
 }
 
-
 /*_________________________________________________________________________________________________
 |
 |  search : (nof_conflicts : int) (params : const SearchParams&)  ->  [lbool]
@@ -661,11 +955,17 @@ lbool Solver::search(int nof_conflicts)
         if (confl != CRef_Undef){
             // CONFLICT
             conflicts++; conflictC++;
+
             if (decisionLevel() == 0) return l_False;
+
+            if (decisionLevel() == ts_crit_lvl && !ts.empty())
+                ts.clear();
 
             learnt_clause.clear();
             analyze(confl, learnt_clause, backtrack_level);
-            cancelUntil(backtrack_level);
+
+            cancelUntil(decisionLevel() - 1);
+            cancelUntil(backtrack_level, true);
 
             if (learnt_clause.size() == 1){
                 uncheckedEnqueue(learnt_clause[0]);
@@ -700,10 +1000,10 @@ lbool Solver::search(int nof_conflicts)
 
         }else{
             // NO CONFLICT
-            if (nof_conflicts >= 0 && conflictC >= nof_conflicts || !withinBudget()){
+            if (!(ts_in_budget = withinBudget()) || nof_conflicts >= 0 && conflictC >= nof_conflicts){
                 // Reached bound on number of conflicts:
                 progress_estimate = progressEstimate();
-                cancelUntil(0);
+                cancelUntil(0, ts_in_budget);
                 return l_Undef; }
 
             // Simplify the set of problem clauses:
@@ -719,6 +1019,9 @@ lbool Solver::search(int nof_conflicts)
                 // Perform user provided assumption:
                 Lit p = assumptions[decisionLevel()];
                 if (value(p) == l_True){
+                    if (decisionLevel() == ts_crit_lvl)
+                        ++ts_crit_lvl;
+
                     // Dummy decision level:
                     newDecisionLevel();
                 }else if (value(p) == l_False){
@@ -812,11 +1115,12 @@ lbool Solver::solve_()
     }
 
     // Search:
+    assert(ts.empty());
     int curr_restarts = 0;
     while (status == l_Undef){
         double rest_base = luby_restart ? luby(restart_inc, curr_restarts) : pow(restart_inc, curr_restarts);
         status = search(rest_base * restart_first);
-        if (!withinBudget()) break;
+        if (!ts_in_budget) break;
         curr_restarts++;
     }
 
@@ -831,6 +1135,7 @@ lbool Solver::solve_()
     }else if (status == l_False && conflict.size() == 0)
         ok = false;
 
+    ts.clear();
     cancelUntil(0);
     return status;
 }
@@ -918,6 +1223,8 @@ void Solver::toDimacs(FILE* f, const vec<Lit>& assumps)
 
 void Solver::relocAll(ClauseAllocator& to)
 {
+    assert(ts.empty());
+
     // All watchers:
     //
     // for (int i = 0; i < watches.size(); i++)

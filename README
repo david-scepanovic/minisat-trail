@@ -18,6 +18,6 @@ cp minisat_static <install-dir>/minisat
 ================================================================================
 EXAMPLES:
 
-Run minisat with same heuristics as version 2.0:
+Run minisat with the new heuristics:
 
-> minisat <cnf-file> -no-luby -rinc=1.5 -phase-saving=0 -rnd-freq=0.02
+> minisat <cnf-file> -no-luby -ts-max-look=1 -ts-max-csize=10 -ts-cap-fact=2.0

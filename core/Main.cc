@@ -51,6 +51,21 @@ void printStats(Solver& solver)
     printf("c decisions             : %-12"PRIu64"   (%4.2f %% random) (%.0f /sec)\n", solver.decisions, (float)solver.rnd_decisions*100 / (float)solver.decisions, solver.decisions   /cpu_time);
     printf("c propagations          : %-12"PRIu64"   (%.0f /sec)\n", solver.propagations, solver.propagations/cpu_time);
     printf("c conflict literals     : %-12"PRIu64"   (%4.2f %% deleted)\n", solver.tot_literals, (solver.max_literals - solver.tot_literals)*100 / (double)solver.max_literals);
+
+    printf("\nc trail saves           : %-12"PRIu64"\n", solver.ts_saves);
+    printf("c saved literals        : %-12"PRIu64"\n", solver.ts_saved_lits);
+    printf("c saved decisions       : %-12"PRIu64"\n", solver.ts_saved_decs);
+    printf("c saved trail uses      : %-12"PRIu64"\n", solver.ts_uses);
+    printf("c saved enqueues        : %-12"PRIu64"\n", solver.ts_enqueues);
+    printf("c saved conflicts       : %-12"PRIu64"\n", solver.ts_confls);
+    printf("c saved skips           : %-12"PRIu64"\n", solver.ts_skips);
+    printf("c saved detaches        : %-12"PRIu64"\n", solver.ts_detaches);
+    printf("c saved trail cleans    : %-12"PRIu64"\n", solver.ts_cleans);
+    printf("c cleaned literals      : %-12"PRIu64"\n", solver.ts_cleaned_lits);
+    printf("c saved lookaheads      : %-12"PRIu64"\n", solver.ts_lookaheads);
+    printf("c forced decisions      : %-12"PRIu64"\n", solver.ts_forced_decs);
+    printf("c conflict decisions    : %-12"PRIu64"\n", solver.ts_confl_decs);
+
     if (mem_used != 0) printf("c Memory used           : %.2f MB\n", mem_used);
     printf("c CPU time              : %g s\n", cpu_time);
 }
@@ -193,7 +208,7 @@ int main(int argc, char** argv)
             }
             fclose(S.output);
         }
-        if (ret == l_True){
+        if (S.output != NULL && ret == l_True){
             printf("v ");
             for (int i = 0; i < S.nVars(); i++)
                 if (S.model[i] != l_Undef)
