@@ -28,6 +28,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include "core/SolverTypes.h"
 
 // #define TS_BRUTE_CRIT_LVLS
+// #define TS_CLBD
 
 namespace Minisat {
 
@@ -35,72 +36,6 @@ namespace Minisat {
 // Solver -- the main class:
 
 class Solver {
-    
-    class TrailSaver 
-    {
-        const Solver& s;
-        vec<Lit>      literals;
-        vec<CRef>     reasons;
-        const double  cap_fact;
-        const int     end = -1;
-        int           piv = end;
-        
-        int  head_          ()                    const { return literals.size() - 1; }
-        void shrink_        (int n)                     { literals.shrink(n); reasons.shrink(n); }
-        void copy_          (int from, int to)          { literals[to] = literals[from]; reasons[to] = reasons[from]; }
-        
-    public:
-        TrailSaver          (const Solver& s) : s(s), cap_fact(s.ts_cap_fact) {}
-                                            
-        int  capacity       ()                    const { assert(reasons.capacity() == literals.capacity()); return literals.capacity(); }
-        int  size           ()                    const { assert(reasons.size() == literals.size()); return literals.size(); }
-        bool empty          ()                    const { return size() == 0; }
-        bool headed         ()                    const { return head_() == piv; }
-        bool hasPivot       ()                    const { assert(piv >= end); return piv != end; }
-        Lit  pivot          ()                    const { assert(hasPivot()); return literals[piv]; }
-        Lit  pivot          (CRef& cr)            const { cr = reasons[piv]; return pivot(); }
-        void movePivot      ()                          { assert(hasPivot()); --piv; }
-        bool confirmPivot   ()                          { const bool r = !headed(); shrink_(head_() - piv); assert(headed()); return r; }
-        bool resetPivot     ()                          { const bool r = !headed(); piv = head_(); assert(headed()); return r; }
-        void push           (Var v)                     { assert(empty()); const int min_cap = cap_fact * (v + 1); literals.capacity(min_cap); reasons.capacity(min_cap); }
-        void save           (Lit l, CRef cr)            { assert(size() < capacity()); literals.push_(l); reasons.push_(cr); }
-        void clear          ()                          { shrink_(size()); resetPivot(); }
-
-        int  clean          ();
-    };
-    
-    struct TSDirtyWatcher
-    {
-        Lit  w;
-        CRef cr;
-        TSDirtyWatcher(Lit w, CRef cr) : w(w), cr(cr) {}
-        bool operator==(const TSDirtyWatcher& dw) const { return cr == dw.cr; }
-        bool operator!=(const TSDirtyWatcher& dw) const { return cr != dw.cr; }
-    };
-    
-    int    ts_max_look;
-    int    ts_max_csize;
-    double ts_cap_fact;
-    
-public:
-    
-    uint64_t ts_saves, ts_saved_lits, ts_saved_decs;
-    uint64_t ts_uses, ts_enqueues, ts_confls, ts_skips, ts_detaches;
-    uint64_t ts_cleans, ts_cleaned_lits;
-    uint64_t ts_lookaheads, ts_forced_decs, ts_confl_decs;
-
-private:
-    
-    TrailSaver ts;
-    int        ts_crit_lvl;
-    bool       ts_in_budget;
-    
-    vec<TSDirtyWatcher> ts_dirties;
-    
-    void saveTrail          (int level);
-    int  lookAhead          ();
-    CRef useSavedTrail      ();
-
 public:
 
     // Constructor/Destructor:
@@ -197,6 +132,16 @@ public:
 
     int       restart_first;      // The initial restart limit.                                                                (default 100)
     double    restart_inc;        // The factor with which the restart limit is multiplied in each restart.                    (default 1.5)
+
+    double    ts_cap_fact;
+    int       ts_max_look;
+
+#if !defined(TS_CLBD)
+    int       ts_max_csize;
+#else
+    int       ts_max_clbd;
+#endif
+
     double    learntsize_factor;  // The intitial limit for learnt clauses is a factor of the original clauses.                (default 1 / 3)
     double    learntsize_inc;     // The limit for learnt clauses is multiplied with this factor each restart.                 (default 1.1)
 
@@ -207,6 +152,11 @@ public:
     //
     uint64_t solves, starts, decisions, rnd_decisions, propagations, conflicts;
     uint64_t dec_vars, clauses_literals, learnts_literals, max_literals, tot_literals;
+
+    uint64_t ts_saves, ts_saved_lits, ts_saved_decs;
+    uint64_t ts_uses, ts_enqueues, ts_confls, ts_skips, ts_detaches;
+    uint64_t ts_cleans, ts_cleaned_lits;
+    uint64_t ts_lookaheads, ts_forced_decs;
 
 protected:
 
@@ -236,6 +186,46 @@ protected:
         VarOrderLt(const vec<double>&  act) : activity(act) { }
     };
 
+    class TrailSaver 
+    {
+        const Solver& s;
+        vec<Lit>      literals;
+        vec<CRef>     reasons;
+        const double  cap_fact;
+        const int     end = -1;
+        int           piv = end;
+        
+        int  head_          ()                    const { return literals.size() - 1; }
+        void shrink_        (int n)                     { literals.shrink(n); reasons.shrink(n); }
+        void copy_          (int from, int to)          { literals[to] = literals[from]; reasons[to] = reasons[from]; }
+        
+    public:
+        TrailSaver          (const Solver& s) : s(s), cap_fact(s.ts_cap_fact) {}
+                                            
+        int  capacity       ()                    const { assert(reasons.capacity() == literals.capacity()); return literals.capacity(); }
+        int  size           ()                    const { assert(reasons.size() == literals.size()); return literals.size(); }
+        bool empty          ()                    const { return size() == 0; }
+        bool headed         ()                    const { return head_() == piv; }
+        bool hasPivot       ()                    const { assert(piv >= end); return piv != end; }
+        Lit  pivot          ()                    const { assert(hasPivot()); return literals[piv]; }
+        Lit  pivot          (CRef& cr)            const { cr = reasons[piv]; return pivot(); }
+        void movePivot      ()                          { assert(hasPivot()); --piv; }
+        bool confirmPivot   ()                          { const bool r = !headed(); shrink_(head_() - piv); assert(headed()); return r; }
+        bool resetPivot     ()                          { const bool r = !headed(); piv = head_(); assert(headed()); return r; }
+        void push           (Var v)                     { assert(empty()); const int min_cap = cap_fact * (v + 1); literals.capacity(min_cap); reasons.capacity(min_cap); }
+        void save           (Lit l, CRef cr)            { assert(size() < capacity()); literals.push_(l); reasons.push_(cr); }
+        void clear          ()                          { shrink_(size()); resetPivot(); }
+
+        int  clean          ();
+    };
+    
+    struct TSDirtyWatcher
+    {
+        Lit  w;
+        CRef cr;
+        TSDirtyWatcher(Lit w, CRef cr) : w(w), cr(cr) {}
+    };
+    
     // Solver state:
     //
     bool                ok;               // If FALSE, the constraints are already unsatisfiable. No part of the solver state may be used!
@@ -262,13 +252,26 @@ protected:
 
     ClauseAllocator     ca;
 
-    // Temporaries (to reduce allocation overhead). Each variable is prefixed by the method in which it is
-    // used, exept 'seen' wich is used in several places.
+    TrailSaver          ts;
+    int                 ts_crit_lvl;
+    bool                ts_in_budget;
+
+#if defined(TS_CLBD)
+    uint64_t            ts_lbd_calcs;
+#endif
+
+    // Temporaries (to reduce allocation overhead).
     //
     vec<char>           seen;
     vec<Lit>            analyze_stack;
     vec<Lit>            analyze_toclear;
     vec<Lit>            add_tmp;
+
+    vec<TSDirtyWatcher> ts_dirties;
+
+#if defined(TS_CLBD)
+    vec<uint64_t>       ts_lbd_seen;
+#endif
 
     double              max_learnts;
     double              learntsize_adjust_confl;
@@ -288,7 +291,7 @@ protected:
     void     uncheckedEnqueue (Lit p, CRef from = CRef_Undef);                         // Enqueue a literal. Assumes value of literal is undefined.
     bool     enqueue          (Lit p, CRef from = CRef_Undef);                         // Test if fact 'p' contradicts current state, enqueue otherwise.
     CRef     propagate        ();                                                      // Perform unit propagation. Returns possibly conflicting clause.
-    void     cancelUntil      (int level, bool save = false);                          // Backtrack until a certain level.
+    void     cancelUntil      (int level);                                             // Backtrack until a certain level.
     void     analyze          (CRef confl, vec<Lit>& out_learnt, int& out_btlevel);    // (bt = backtrack)
     void     analyzeFinal     (Lit p, vec<Lit>& out_conflict);                         // COULD THIS BE IMPLEMENTED BY THE ORDINARIY "analyze" BY SOME REASONABLE GENERALIZATION?
     bool     litRedundant     (Lit p, uint32_t abstract_levels);                       // (helper method for 'analyze()')
@@ -297,6 +300,10 @@ protected:
     void     reduceDB         ();                                                      // Reduce the set of learnt clauses.
     void     removeSatisfied  (vec<CRef>& cs);                                         // Shrink 'cs' to contain only non-satisfied clauses.
     void     rebuildOrderHeap ();
+
+    void     saveTrail        (int level);
+    bool     lookAhead        ();
+    CRef     useSavedTrail    ();
 
     // Maintaining Variable/Clause activity:
     //

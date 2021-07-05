@@ -39,13 +39,18 @@ using namespace Minisat;
 
 static const char* _cat = "CORE";
 
-static IntOption     opt_ts_max_look       (_cat, "ts-max-look",  "The maximum number of saved levels solver will traverse for conflict lookahead", 2, IntRange(0, INT32_MAX));
-static IntOption     opt_ts_max_csize      (_cat, "ts-max-csize", "The maximum size of saved clauses solver will unit propagate", INT32_MAX, IntRange(0, INT32_MAX)); 
-
 #if !defined(TS_BRUTE_CRIT_LVLS)
 static DoubleOption  opt_ts_cap_fact       (_cat, "ts-cap-fact",  "Controls maximum saved trail capacity relative to the variable count", 1, DoubleRange(1, true, HUGE_VAL, false));
-#else 
+#else
 static DoubleOption  opt_ts_cap_fact       (_cat, "ts-cap-fact",  "Controls maximum saved trail capacity relative to the variable count", 2, DoubleRange(2, true, HUGE_VAL, false));
+#endif
+
+static IntOption     opt_ts_max_look       (_cat, "ts-max-look",  "The maximum number of saved levels solver will traverse for conflict lookahead", 2, IntRange(0, INT32_MAX));
+
+#if !defined(TS_CLBD)
+static IntOption     opt_ts_max_csize      (_cat, "ts-max-csize", "The maximum size of saved clauses solver will unit propagate", INT32_MAX, IntRange(0, INT32_MAX)); 
+#else
+static IntOption     opt_ts_max_clbd       (_cat, "ts-max-clbd",  "The maximum lbd of saved clauses solver will unit propagate", 4, IntRange(0, INT32_MAX)); 
 #endif
 
 static DoubleOption  opt_var_decay         (_cat, "var-decay",   "The variable activity decay factor",            0.95,     DoubleRange(0, false, 1, false));
@@ -69,24 +74,7 @@ Solver::Solver() :
 
     // Parameters (user settable):
     //
-    ts_max_look      (opt_ts_max_look)
-  , ts_max_csize     (opt_ts_max_csize)
-  , ts_cap_fact      (opt_ts_cap_fact)
-
-    // Statistics:
-    //
-  , ts_saves(0), ts_saved_lits(0), ts_saved_decs(0)
-  , ts_uses(0), ts_enqueues(0), ts_confls(0), ts_skips(0), ts_detaches(0)
-  , ts_cleans(0), ts_cleaned_lits(0)
-  , ts_lookaheads(0), ts_forced_decs(0), ts_confl_decs(0)
-    
-  , ts               (*this)
-  , ts_crit_lvl      (0)
-  , ts_in_budget     (true)
-
-    // Parameters (user settable):
-    //
-  , verbosity        (0)
+    verbosity        (0)
   , var_decay        (opt_var_decay)
   , clause_decay     (opt_clause_decay)
   , random_var_freq  (opt_random_var_freq)
@@ -100,6 +88,15 @@ Solver::Solver() :
   , restart_first    (opt_restart_first)
   , restart_inc      (opt_restart_inc)
 
+  , ts_cap_fact      (opt_ts_cap_fact)
+  , ts_max_look      (opt_ts_max_look)
+
+#if !defined(TS_CLBD)
+  , ts_max_csize     (opt_ts_max_csize)
+#else
+  , ts_max_clbd      (opt_ts_max_clbd)
+#endif
+
     // Parameters (the rest):
     //
   , learntsize_factor((double)1/(double)3), learntsize_inc(1.1)
@@ -109,10 +106,15 @@ Solver::Solver() :
   , learntsize_adjust_start_confl (100)
   , learntsize_adjust_inc         (1.5)
 
-    // Statistics: (formerly in 'SolverStats')
+    // Statistics:
     //
   , solves(0), starts(0), decisions(0), rnd_decisions(0), propagations(0), conflicts(0)
   , dec_vars(0), clauses_literals(0), learnts_literals(0), max_literals(0), tot_literals(0)
+
+  , ts_saves(0), ts_saved_lits(0), ts_saved_decs(0)
+  , ts_uses(0), ts_enqueues(0), ts_confls(0), ts_skips(0), ts_detaches(0)
+  , ts_cleans(0), ts_cleaned_lits(0)
+  , ts_lookaheads(0), ts_forced_decs(0)
 
   , ok                 (true)
   , cla_inc            (1)
@@ -124,6 +126,14 @@ Solver::Solver() :
   , order_heap         (VarOrderLt(activity))
   , progress_estimate  (0)
   , remove_satisfied   (true)
+
+  , ts                 (*this)
+  , ts_crit_lvl        (0)
+  , ts_in_budget       (true)
+
+#if defined(TS_CLBD)
+  , ts_lbd_calcs       (0)
+#endif
 
     // Resource constraints:
     //
@@ -149,6 +159,11 @@ Var Solver::newVar(bool sign, bool dvar)
 {
     int v = nVars();
     ts       .push(v);
+
+#if defined(TS_CLBD)
+    ts_lbd_seen.push(0);
+#endif
+
     watches  .init(mkLit(v, false));
     watches  .init(mkLit(v, true ));
     assigns  .push(l_Undef);
@@ -270,15 +285,8 @@ bool Solver::satisfied(const Clause& c) const {
 
 // Revert to the state at given level (keeping all assignment at 'level' but not beyond).
 //
-void Solver::cancelUntil(int level, bool save) {
+void Solver::cancelUntil(int level) {
     if (decisionLevel() > level){
-        if (save) 
-            saveTrail(level);
-#if defined(TS_BRUTE_CRIT_LVLS)
-        else
-            ts_crit_lvl = level;
-#endif
-
         for (int c = trail.size()-1; c >= trail_lim[level]; c--){
             Var      x  = var(trail[c]);
             assigns [x] = l_Undef;
@@ -337,29 +345,24 @@ int Solver::TrailSaver::clean()
 #if !defined(TS_BRUTE_CRIT_LVLS)
         lbool val = s.value(l);
         if (val == l_Undef && signs[v] == l_Undef)
-        {
-            signs[v] = lbool(sign(l));
-            copy_(i, --j);
-        }
-        else if (val == l_False || (signs[v] != l_Undef && signs[v] != lbool(sign(l))))
-        {
-            if (reasons[i] != CRef_Undef)
-                copy_(i, --j);
-            break;
-        }
 #else
         if (signs[v] == l_Undef)
+#endif
         {
             signs[v] = lbool(sign(l));
             copy_(i, --j);
         }
+#if !defined(TS_BRUTE_CRIT_LVLS)
+        else if (val == l_False || (signs[v] != l_Undef && signs[v] != lbool(sign(l))))
+#else
         else if (signs[v] != lbool(sign(l)))
+#endif
         {
             if (reasons[i] != CRef_Undef)
                 copy_(i, --j);
             break;
         }
-#endif
+
     }
 
     const int clean_cnt = head_() - i + (i != end);
@@ -373,15 +376,16 @@ int Solver::TrailSaver::clean()
     return clean_cnt;
 }
 
-int Solver::lookAhead()
+bool Solver::lookAhead()
 {
     assert(ts_max_look > 0);
     assert(ts.hasPivot());
     assert(value(ts.pivot()) == l_Undef);
 
     bool confl = false;
-    int lvl_ahead = 1;
-    for (ts.movePivot(); ts.hasPivot(); ts.movePivot())
+
+    ts.movePivot();
+    for (int lvl_ahead = 1; ts.hasPivot(); ts.movePivot())
     {
         CRef cr;
         Lit l = ts.pivot(cr);
@@ -409,7 +413,7 @@ int Solver::lookAhead()
     ts.resetPivot();
 
     ++ts_lookaheads;
-    return confl ? lvl_ahead : -1;
+    return confl;
 }
 
 Lit Solver::pickBranchLit()
@@ -418,20 +422,14 @@ Lit Solver::pickBranchLit()
     if (ts.hasPivot())
     {
         Lit l = ts.pivot();
+        
         if (value(l) == l_Undef)
         {
-            if (ts_max_look > 0)
+            if (ts_max_look > 0 && lookAhead())
             {
-                int confl_dist = lookAhead();
                 assert(ts.headed());
-                if (confl_dist != -1)
-                {
-                    assert(confl_dist != 0);
-                    if (confl_dist == 1)
-                        ++ts_confl_decs;
-                    ++ts_forced_decs;
-                    return l;
-                }
+                ++ts_forced_decs;
+                return l;
             }
         }
 #if !defined(TS_BRUTE_CRIT_LVLS)
@@ -441,6 +439,7 @@ Lit Solver::pickBranchLit()
             ts.clear();
         }
 #endif
+
     }
 
     Var next = var_Undef;
@@ -658,8 +657,9 @@ CRef Solver::useSavedTrail()
     assert(ts.hasPivot());
     assert(value(ts.pivot()) == l_True);
     
+    ts.movePivot();
     ++ts_skips;
-    for (ts.movePivot(); ts.hasPivot(); ts.movePivot())
+    for (; ts.hasPivot(); ts.movePivot())
     {
         CRef cr;
         Lit l = ts.pivot(cr);
@@ -670,29 +670,58 @@ CRef Solver::useSavedTrail()
             if (cr != CRef_Undef)
             {   
                 Clause& c = ca[cr];
+
+#if !defined(TS_CLBD)
                 if (c.size() > ts_max_csize)
                     return CRef_Undef;
                 
-                if (c[0] != l)
+                int i = 0;
+                for (int i_end = c.size() - 1; i < i_end; ++i)
                 {
-                    if (c[1] != l)
+                    if (c[i] == l)
+                        break;
+                }
+#else
+                int ts_clbd = 0;
+                ++ts_lbd_calcs;
+
+                int i = c.size();
+                for (int j = 0; j < c.size(); ++j) 
+                {
+                    Lit lj = c[j];
+
+                    if (lj != l)
+                    {
+                        int lvl_j = level(var(lj));
+                        if (ts_lbd_seen[lvl_j] != ts_lbd_calcs)
+                        {
+                            ts_lbd_seen[lvl_j] = ts_lbd_calcs;
+                            ++ts_clbd;
+                        }
+                    } 
+                    else 
+                        i = j;
+                }
+
+                if (ts_clbd > ts_max_clbd)
+                    return CRef_Undef;
+#endif
+
+                assert(0 <= i && i < c.size());
+                assert(c[i] == l);
+                
+                if (i != 0)
+                {
+                    if (i != 1)
                     {
                         assert(c.mark() == 0);
                         c.mark(1);
                     
                         watches[~l].push(Watcher(cr, c[1]));
                         ts_dirties.push(TSDirtyWatcher(~c[1], cr));
-                        
-                        int i = 2;
-                        for (int i_end = c.size() - 1; i < i_end; ++i)
-                        {
-                            if (c[i] == l) 
-                                break;
-                        }
-                        assert(c[i] == l);
                         c[i] = c[1];
                     }
-                    
+
                     c[1] = c[0];
                     c[0] = l;
                 }
@@ -759,10 +788,10 @@ CRef Solver::propagate()
             ++i;
             if (c[1] != false_lit)
             {
-                if (c.mark() == 1)
+                if (c[0] != false_lit)
                 {
+                    assert(c.mark() == 1);
                     assert(value(c[0]) == l_True);
-                    assert(find(ts_dirties, TSDirtyWatcher(false_lit, cr)));
                     c.mark(0);
                     ++ts_unmarked;
                     continue;
@@ -829,9 +858,11 @@ CRef Solver::propagate()
     else if (ts.confirmPivot()) 
     {
         assert(ts_dirties.size() == ts_unmarked);
+
 #if !defined(TS_BRUTE_CRIT_LVLS)
         ts_crit_lvl = decisionLevel();
 #endif
+
         ++ts_uses;
     }
     assert(ts.headed());
@@ -965,7 +996,16 @@ lbool Solver::search(int nof_conflicts)
             analyze(confl, learnt_clause, backtrack_level);
 
             cancelUntil(decisionLevel() - 1);
-            cancelUntil(backtrack_level, true);
+
+            if (decisionLevel() != backtrack_level)
+            {
+                saveTrail(backtrack_level);
+                cancelUntil(backtrack_level);
+            }
+#if defined(TS_BRUTE_CRIT_LVLS)
+            else
+                ts_crit_lvl = backtrack_level;
+#endif
 
             if (learnt_clause.size() == 1){
                 uncheckedEnqueue(learnt_clause[0]);
@@ -1003,7 +1043,9 @@ lbool Solver::search(int nof_conflicts)
             if (!(ts_in_budget = withinBudget()) || nof_conflicts >= 0 && conflictC >= nof_conflicts){
                 // Reached bound on number of conflicts:
                 progress_estimate = progressEstimate();
-                cancelUntil(0, ts_in_budget);
+                if (decisionLevel() != 0 && ts_in_budget)
+                    saveTrail(0);
+                cancelUntil(0);
                 return l_Undef; }
 
             // Simplify the set of problem clauses:

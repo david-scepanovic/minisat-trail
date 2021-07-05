@@ -65,7 +65,6 @@ void printStats(Solver& solver)
     printf("c cleaned literals      : %-12"PRIu64"\n", solver.ts_cleaned_lits);
     printf("c saved lookaheads      : %-12"PRIu64"\n", solver.ts_lookaheads);
     printf("c forced decisions      : %-12"PRIu64"\n", solver.ts_forced_decs);
-    printf("c conflict decisions    : %-12"PRIu64"\n", solver.ts_confl_decs);
 
     if (mem_used != 0) printf("c Memory used           : %.2f MB\n", mem_used);
     printf("c CPU time              : %g s\n", cpu_time);
