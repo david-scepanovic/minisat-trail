@@ -214,7 +214,7 @@ int main(int argc, char** argv)
             }
             fclose(S.output);
         }
-        if (ret == l_True){
+        if (S.output != NULL && ret == l_True){
             printf("v ");
             for (int i = 0; i < S.nVars(); i++)
                 if (S.model[i] != l_Undef)
