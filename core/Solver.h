@@ -91,6 +91,8 @@ public:
     int     nVars      ()      const;       // The current number of variables.
     int     nFreeVars  ()      const;
 
+    void    printStats ()      const;
+
     // Resource contraints:
     //
     void    setConfBudget(int64_t x);
